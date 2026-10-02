@@ -90,6 +90,9 @@ struct Api {
 struct RunstateApi {
     vcpu_has_runstate: unsafe extern "C" fn(P) -> c_uint,
     vcpu_runnable_ns: unsafe extern "C" fn(P) -> c_ulonglong,
+    /// Hypervisor time of the snapshot; absent from libraries built
+    /// before patch 0004 exported it.
+    vcpu_runstate_time_ns: Option<unsafe extern "C" fn(P) -> c_ulonglong>,
 }
 
 /// Symbols from the xentop-ng libxenstat patch.
@@ -161,6 +164,7 @@ impl XenstatSource {
             Some(RunstateApi {
                 vcpu_has_runstate: opt!("xenstat_vcpu_has_runstate")?,
                 vcpu_runnable_ns: opt!("xenstat_vcpu_runnable_ns")?,
+                vcpu_runstate_time_ns: opt!("xenstat_vcpu_runstate_time_ns"),
             })
         })();
 
@@ -307,14 +311,19 @@ impl XenstatSource {
                 let vcpus = (0..(a.domain_num_vcpus)(dp))
                     .filter_map(|j| {
                         let v = (a.domain_vcpu)(dp, j);
-                        (!v.is_null()).then(|| VcpuRaw {
+                        if v.is_null() {
+                            return None;
+                        }
+                        let rs = a.runstate.as_ref().filter(|r| (r.vcpu_has_runstate)(v) != 0);
+                        Some(VcpuRaw {
                             online: (a.vcpu_online)(v) != 0,
                             ns: (a.vcpu_ns)(v),
-                            runnable_ns: a
-                                .runstate
-                                .as_ref()
-                                .filter(|r| (r.vcpu_has_runstate)(v) != 0)
-                                .map(|r| (r.vcpu_runnable_ns)(v)),
+                            runnable_ns: rs.map(|r| (r.vcpu_runnable_ns)(v)),
+                            // 0: a hypervisor that doesn't report it.
+                            runstate_at_ns: rs
+                                .and_then(|r| r.vcpu_runstate_time_ns)
+                                .map(|f| f(v))
+                                .filter(|&t| t != 0),
                         })
                     })
                     .collect();

@@ -233,6 +233,7 @@ mod tests {
                 online: true,
                 ns: 0,
                 runnable_ns: None,
+                runstate_at_ns: None,
             }],
             cur_mem: 0,
             max_mem: 0,

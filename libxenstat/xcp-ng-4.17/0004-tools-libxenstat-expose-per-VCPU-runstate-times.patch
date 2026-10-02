@@ -1,4 +1,4 @@
-From df9e89313c9584ae0950c16421af805e8188ce4c Mon Sep 17 00:00:00 2001
+From 33a0237da8dd3eab870c8de1dafb1b016a84a5d7 Mon Sep 17 00:00:00 2001
 From: Olivier Lambert <olivier.lambert@vates.tech>
 Date: Thu, 1 Oct 2026 08:05:00 +0200
 Subject: [PATCH] tools/libxenstat: expose per-VCPU runstate times
@@ -10,9 +10,17 @@ accessors:
  - xenstat_vcpu_has_runstate(): 1 if the times below are valid;
  - xenstat_vcpu_runnable_ns(): runnable but not running, i.e. waiting
    for a physical CPU ("steal time");
- - xenstat_vcpu_blocked_ns() and xenstat_vcpu_offline_ns().
+ - xenstat_vcpu_blocked_ns() and xenstat_vcpu_offline_ns();
+ - xenstat_vcpu_running_ns(): running time, from the same snapshot;
+ - xenstat_vcpu_runstate_time_ns(): the hypervisor time those times
+   run to, or 0 if the hypervisor doesn't report it.
 
-Running time stays available through xenstat_vcpu_ns().
+Rates must be computed over differences in xenstat_vcpu_runstate_time_ns(),
+not the caller's clock: the caller can be descheduled between the
+hypercall and its own clock read, which is exactly when the host is
+contended.  xenstat_vcpu_ns() keeps returning running time from
+XEN_DOMCTL_getvcpuinfo, read at a slightly different moment; use
+xenstat_vcpu_running_ns() next to the other runstate times.
 
 On a hypervisor without the domctl, or when XSM denies it, the first
 call fails and the handle stops asking, so the cost there is a single
@@ -29,16 +37,16 @@ ABI is unchanged.
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 ---
- tools/include/xenstat.h        | 13 +++++++
- tools/libs/stat/xenstat.c      | 68 ++++++++++++++++++++++++++++++++++
- tools/libs/stat/xenstat_priv.h |  7 ++++
- 3 files changed, 88 insertions(+)
+ tools/include/xenstat.h        | 23 ++++++++++
+ tools/libs/stat/xenstat.c      | 83 ++++++++++++++++++++++++++++++++++
+ tools/libs/stat/xenstat_priv.h |  9 ++++
+ 3 files changed, 115 insertions(+)
 
 diff --git a/tools/include/xenstat.h b/tools/include/xenstat.h
-index e197d64..0608a54 100644
+index e197d649c8..bec0e11447 100644
 --- a/tools/include/xenstat.h
 +++ b/tools/include/xenstat.h
-@@ -149,6 +149,19 @@ xenstat_vbd *xenstat_domain_vbd(xenstat_domain * domain,
+@@ -149,6 +149,29 @@ xenstat_vbd *xenstat_domain_vbd(xenstat_domain * domain,
  unsigned int xenstat_vcpu_online(xenstat_vcpu * vcpu);
  unsigned long long xenstat_vcpu_ns(xenstat_vcpu * vcpu);
  
@@ -54,12 +62,22 @@ index e197d64..0608a54 100644
 +unsigned long long xenstat_vcpu_blocked_ns(xenstat_vcpu * vcpu);
 +/* Offline: down, or paused by the toolstack or hypervisor */
 +unsigned long long xenstat_vcpu_offline_ns(xenstat_vcpu * vcpu);
++/* Running, from the same snapshot as the times above */
++unsigned long long xenstat_vcpu_running_ns(xenstat_vcpu * vcpu);
++/*
++ * Hypervisor system time (ns) the runstate times above run to.  Compute
++ * rates as differences in those times over differences in this one, not
++ * over the caller's clock: the caller can be descheduled between the
++ * hypercall and its own clock read, which is exactly when the host is
++ * contended.  0 if the hypervisor doesn't report it.
++ */
++unsigned long long xenstat_vcpu_runstate_time_ns(xenstat_vcpu * vcpu);
 +
  
  /*
   * Network functions - extract information from a xenstat_network
 diff --git a/tools/libs/stat/xenstat.c b/tools/libs/stat/xenstat.c
-index 60f17fe..ec098c0 100644
+index 60f17fe73f..6bc5d7a647 100644
 --- a/tools/libs/stat/xenstat.c
 +++ b/tools/libs/stat/xenstat.c
 @@ -26,6 +26,7 @@
@@ -70,7 +88,7 @@ index 60f17fe..ec098c0 100644
  
  /*
   * Data-collection types
-@@ -500,6 +501,46 @@ xenstat_vbd *xenstat_domain_vbd(xenstat_domain * domain,
+@@ -500,6 +501,49 @@ xenstat_vbd *xenstat_domain_vbd(xenstat_domain * domain,
  /*
   * VCPU functions
   */
@@ -94,6 +112,7 @@ index 60f17fe..ec098c0 100644
 +
 +	v->has_runstate = 0;
 +	v->runnable_ns = v->blocked_ns = v->offline_ns = 0;
++	v->running_ns = v->runstate_time_ns = 0;
 +	if (handle->no_vcpu_runstate)
 +		return;
 +
@@ -112,12 +131,14 @@ index 60f17fe..ec098c0 100644
 +	v->runnable_ns = rs->time[RUNSTATE_runnable];
 +	v->blocked_ns = rs->time[RUNSTATE_blocked];
 +	v->offline_ns = rs->time[RUNSTATE_offline];
++	v->running_ns = rs->time[RUNSTATE_running];
++	v->runstate_time_ns = rs->sample_time;
 +}
 +
  /* Collect information about VCPUs */
  static int xenstat_collect_vcpus(xenstat_node * node)
  {
-@@ -537,6 +578,9 @@ static int xenstat_collect_vcpus(xenstat_node * node)
+@@ -537,6 +581,9 @@ static int xenstat_collect_vcpus(xenstat_node * node)
  			else {
  				node->domains[i].vcpus[vcpu].online = info.online;
  				node->domains[i].vcpus[vcpu].ns = info.cpu_time;
@@ -127,7 +148,7 @@ index 60f17fe..ec098c0 100644
  			}
  		}
  	}
-@@ -568,6 +612,30 @@ unsigned long long xenstat_vcpu_ns(xenstat_vcpu * vcpu)
+@@ -568,6 +615,42 @@ unsigned long long xenstat_vcpu_ns(xenstat_vcpu * vcpu)
  	return vcpu->ns;
  }
  
@@ -155,11 +176,23 @@ index 60f17fe..ec098c0 100644
 +	return vcpu->offline_ns;
 +}
 +
++/* Get time spent running, from the same snapshot */
++unsigned long long xenstat_vcpu_running_ns(xenstat_vcpu * vcpu)
++{
++	return vcpu->running_ns;
++}
++
++/* Get the hypervisor time the runstate times run to */
++unsigned long long xenstat_vcpu_runstate_time_ns(xenstat_vcpu * vcpu)
++{
++	return vcpu->runstate_time_ns;
++}
++
  /*
   * Network functions
   */
 diff --git a/tools/libs/stat/xenstat_priv.h b/tools/libs/stat/xenstat_priv.h
-index aeeb6fc..f41c9d3 100644
+index aeeb6fc881..4a71a14e4b 100644
 --- a/tools/libs/stat/xenstat_priv.h
 +++ b/tools/libs/stat/xenstat_priv.h
 @@ -38,6 +38,8 @@ struct xenstat_handle {
@@ -171,7 +204,7 @@ index aeeb6fc..f41c9d3 100644
  };
  
  struct xenstat_node {
-@@ -74,6 +76,11 @@ struct xenstat_domain {
+@@ -74,6 +76,13 @@ struct xenstat_domain {
  struct xenstat_vcpu {
  	unsigned int online;
  	unsigned long long ns;
@@ -180,6 +213,8 @@ index aeeb6fc..f41c9d3 100644
 +	unsigned long long runnable_ns;
 +	unsigned long long blocked_ns;
 +	unsigned long long offline_ns;
++	unsigned long long running_ns;
++	unsigned long long runstate_time_ns;
  };
  
  struct xenstat_network {

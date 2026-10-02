@@ -101,6 +101,12 @@ pub struct VcpuRaw {
     /// Cumulative time runnable but not running, i.e. waiting for a pCPU
     /// (steal time). Needs a hypervisor with XEN_DOMCTL_get_vcpu_runstate.
     pub runnable_ns: Option<u64>,
+    /// Hypervisor system time `runnable_ns` runs to, from the same
+    /// snapshot. Steal is computed over its difference rather than the
+    /// snapshot's wall clock: this process can be descheduled between the
+    /// hypercall and reading its own clock, exactly when the host is
+    /// contended. `None` with an older libxenstat or hypervisor.
+    pub runstate_at_ns: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -457,23 +463,35 @@ fn lat(usecs: u64, reqs: u64) -> Option<f64> {
     (reqs > 0).then(|| usecs as f64 / reqs as f64)
 }
 
-/// Runnable time each vCPU accumulated over the interval, or `None` for
-/// vCPUs without runstate data in either sample.
-fn vcpu_runnable(cur: &DomainRaw, prev: &DomainRaw) -> Vec<Option<u64>> {
+/// Share of the interval each vCPU spent runnable (0..1), or `None` for
+/// vCPUs without runstate data in either sample. Measured against the
+/// hypervisor's own snapshot times when both samples have them, so the
+/// figure doesn't depend on when this process got to read its clock;
+/// otherwise against the wall-clock interval `dt_ns`.
+fn vcpu_runnable(cur: &DomainRaw, prev: &DomainRaw, dt_ns: f64) -> Vec<Option<f64>> {
     cur.vcpus
         .iter()
         .enumerate()
-        .map(|(i, v)| Some(d(v.runnable_ns?, prev.vcpus.get(i)?.runnable_ns?)))
+        .map(|(i, v)| {
+            let p = prev.vcpus.get(i)?;
+            let ran = d(v.runnable_ns?, p.runnable_ns?) as f64;
+            let span = match (v.runstate_at_ns, p.runstate_at_ns) {
+                (Some(c), Some(p)) if c > p => (c - p) as f64,
+                _ => dt_ns,
+            };
+            Some((ran / span).min(1.0))
+        })
         .collect()
 }
 
-/// Runnable time the whole domain accumulated over the interval: the sum of
-/// its vCPUs' when every vCPU has data, else the domain-wide counter.
-fn dom_runnable(cur: &DomainRaw, prev: &DomainRaw, per_vcpu: &[Option<u64>]) -> Option<u64> {
+/// vCPUs' worth of runnable time per unit of time for the whole domain:
+/// the sum of its vCPUs' shares when every vCPU has data, else the
+/// domain-wide counter over the wall-clock interval.
+fn dom_runnable(cur: &DomainRaw, prev: &DomainRaw, per_vcpu: &[Option<f64>], dt_ns: f64) -> Option<f64> {
     if !per_vcpu.is_empty() && per_vcpu.iter().all(Option::is_some) {
-        return Some(per_vcpu.iter().flatten().fold(0u64, |a, &b| a.saturating_add(b)));
+        return Some(per_vcpu.iter().flatten().sum());
     }
-    Some(d(cur.runnable_ns?, prev.runnable_ns?))
+    Some(d(cur.runnable_ns?, prev.runnable_ns?) as f64 / dt_ns)
 }
 
 /// Linux-style disk name for a Xen virtual block device number.
@@ -566,8 +584,8 @@ pub fn compute(prev: &Snapshot, cur: &Snapshot) -> Rates {
     let (mut h_rd_us, mut h_wr_us, mut h_rd_done, mut h_wr_done) = (0u64, 0u64, 0u64, 0u64);
     let mut dom_cpu_total = 0f64;
     let mut srs: HashMap<String, SrAcc> = HashMap::new();
-    // Steal over domains that report it: (runnable ns, online vCPUs).
-    let mut h_steal: Option<(u64, usize)> = None;
+    // Steal over domains that report it: (runnable vCPUs, online vCPUs).
+    let mut h_steal: Option<(f64, usize)> = None;
 
     let mut domains = Vec::with_capacity(cur.domains.len());
     for dom in &cur.domains {
@@ -596,13 +614,12 @@ pub fn compute(prev: &Snapshot, cur: &Snapshot) -> Rates {
                     (d(v.ns, pv) as f64 / dt_ns * 100.0).min(100.0)
                 })
                 .collect();
-            let per_vcpu = vcpu_runnable(dom, p);
-            let pct = |ns: u64, n: usize| (ns as f64 / (dt_ns * n.max(1) as f64) * 100.0).min(100.0);
-            r.vcpu_steal_pct = per_vcpu.iter().map(|x| x.map(|ns| pct(ns, 1))).collect();
-            if let Some(ns) = dom_runnable(dom, p, &per_vcpu) {
-                r.steal_pct = Some(pct(ns, r.vcpus_online));
+            let per_vcpu = vcpu_runnable(dom, p, dt_ns);
+            r.vcpu_steal_pct = per_vcpu.iter().map(|x| x.map(|f| f * 100.0)).collect();
+            if let Some(run) = dom_runnable(dom, p, &per_vcpu, dt_ns) {
+                r.steal_pct = Some((run / r.vcpus_online.max(1) as f64 * 100.0).min(100.0));
                 let (hr, hv) = h_steal.unwrap_or_default();
-                h_steal = Some((hr.saturating_add(ns), hv + r.vcpus_online.max(1)));
+                h_steal = Some((hr + run, hv + r.vcpus_online.max(1)));
             }
         } else {
             r.vcpu_pct = vec![0.0; dom.vcpus.len()];
@@ -732,8 +749,7 @@ pub fn compute(prev: &Snapshot, cur: &Snapshot) -> Rates {
     // that reports it. A share-of-demand ratio looks dramatic on idle hosts
     // (a few ms of wake-up latency against a few ms of work) and would not
     // match the STEAL column.
-    host.steal_pct =
-        h_steal.map(|(run, vcpus)| (run as f64 / (dt_ns * vcpus.max(1) as f64) * 100.0).min(100.0));
+    host.steal_pct = h_steal.map(|(run, vcpus)| (run / vcpus.max(1) as f64 * 100.0).min(100.0));
 
     match (&prev.pcpu_idle_ns, &cur.pcpu_idle_ns) {
         (Some(pi), Some(ci)) if !ci.is_empty() => {
@@ -838,6 +854,7 @@ mod rate_tests {
                 online: true,
                 ns: cpu_ns,
                 runnable_ns: None,
+                runstate_at_ns: None,
             }],
             cur_mem: 0,
             max_mem: 0,
@@ -1210,6 +1227,7 @@ mod rate_tests {
                     online: true,
                     ns: cpu_ns / steal.len() as u64,
                     runnable_ns: s,
+                    runstate_at_ns: None,
                 })
                 .collect(),
             ..dom(7, "vm", cpu_ns, 0)
@@ -1235,6 +1253,35 @@ mod rate_tests {
         assert!((d.steal_pct.unwrap() - 20.0).abs() < 1e-9);
         // Host: same definition, over every reporting vCPU.
         assert!((r.host.steal_pct.unwrap() - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn steal_uses_the_hypervisor_sample_time() {
+        // Runnable counters 1 s apart in hypervisor time; this process read
+        // its clock 2 s apart (descheduled after the second hypercall).
+        let at = |d: &mut DomainRaw, t: u64| d.vcpus.iter_mut().for_each(|v| v.runstate_at_ns = Some(t));
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(2);
+        let mut a = steal_dom(0, &[Some(0)]);
+        let mut b = steal_dom(1_000_000_000, &[Some(500_000_000)]);
+        at(&mut a, 10_000_000_000);
+        at(&mut b, 11_000_000_000);
+        let r = compute(&snap(t0, vec![a.clone()]), &snap(t1, vec![b.clone()]));
+        assert!((r.domains[0].vcpu_steal_pct[0].unwrap() - 50.0).abs() < 1e-9);
+        assert!((r.domains[0].steal_pct.unwrap() - 50.0).abs() < 1e-9);
+        assert!((r.host.steal_pct.unwrap() - 50.0).abs() < 1e-9);
+        // The other way round (clock read 0.5 s apart): still 50%, not a
+        // clamped 100%.
+        let r = compute(
+            &snap(t0, vec![a.clone()]),
+            &snap(t0 + Duration::from_millis(500), vec![b.clone()]),
+        );
+        assert!((r.domains[0].steal_pct.unwrap() - 50.0).abs() < 1e-9);
+        // Without the timestamp (older libxenstat or hypervisor), the wall
+        // clock is all there is.
+        b.vcpus[0].runstate_at_ns = None;
+        let r = compute(&snap(t0, vec![a]), &snap(t1, vec![b]));
+        assert!((r.domains[0].steal_pct.unwrap() - 25.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1357,6 +1404,7 @@ mod overflow_tests {
                     online: true,
                     ns: u64::MAX,
                     runnable_ns: Some(u64::MAX),
+                    runstate_at_ns: None,
                 };
                 2
             ],

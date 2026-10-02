@@ -113,11 +113,19 @@ struct xen_domctl_vcpu_runstate {
     uint32_t state;                    /* OUT: current RUNSTATE_* */
     uint64_aligned_t state_entry_time; /* OUT: system time, ns */
     uint64_aligned_t time[4];          /* OUT: ns in each RUNSTATE_* */
+    uint64_aligned_t sample_time;      /* OUT: system time time[] runs to */
 };
 ```
 
-It returns `vcpu_runstate_get()` for one vCPU of the target domain, brought
-up to the time of the call. It is handled like `XEN_DOMCTL_getvcpuinfo`
+It returns one vCPU's runstate times, brought up to `sample_time`, which
+is read inside the same consistent (seqcount) snapshot through a new
+`vcpu_runstate_snapshot()`. Rates must be computed over differences in
+`sample_time`, not over the caller's own clock: the caller can be
+descheduled between the hypercall and reading its clock, which is exactly
+when the host is contended, so pairing the times with its clock skews
+steal (even past 100%). The earlier version of this patch didn't return
+`sample_time`; it is the last field, so a hypervisor with that version
+leaves it at the 0 the caller passes in. It is handled like `XEN_DOMCTL_getvcpuinfo`
 (read-only scheduler accounting, outside the domctl lock on master) and
 uses the same XSM permission, `domain:getvcpuinfo`. libxenctrl gets a
 wrapper:
@@ -136,10 +144,17 @@ unsigned int       xenstat_vcpu_has_runstate(xenstat_vcpu *vcpu);
 unsigned long long xenstat_vcpu_runnable_ns(xenstat_vcpu *vcpu); /* steal time */
 unsigned long long xenstat_vcpu_blocked_ns(xenstat_vcpu *vcpu);
 unsigned long long xenstat_vcpu_offline_ns(xenstat_vcpu *vcpu);
+unsigned long long xenstat_vcpu_running_ns(xenstat_vcpu *vcpu);  /* same snapshot */
+/* Hypervisor time (ns) the times above run to; 0 if not reported */
+unsigned long long xenstat_vcpu_runstate_time_ns(xenstat_vcpu *vcpu);
 ```
 
-Running time stays `xenstat_vcpu_ns()`. The cost is one more hypercall per
-vCPU per sample, next to the existing `xc_vcpu_getinfo()`.
+`xenstat_vcpu_ns()` keeps returning running time from `xc_vcpu_getinfo()`,
+read at a slightly different moment; `xenstat_vcpu_running_ns()` comes from
+the same snapshot as the other times. xentop-ng computes steal over
+differences in `xenstat_vcpu_runstate_time_ns()` when both samples have it,
+and over its own clock otherwise. The cost is one more hypercall per vCPU
+per sample, next to the existing `xc_vcpu_getinfo()`.
 
 **XCP-ng differences**:
 

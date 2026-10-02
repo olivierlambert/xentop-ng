@@ -890,6 +890,7 @@ Report bugs to <xen-devel@lists.xen.org>.
                     online: f[0] != "0",
                     ns: num(f[1]),
                     runnable_ns: None,
+                    runstate_at_ns: None,
                 }),
                 "net" => {
                     let n: Vec<u64> = f.iter().map(|x| num(x)).collect();

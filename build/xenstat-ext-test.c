@@ -171,13 +171,30 @@ int main(void)
             }
             if (!p || !xenstat_vcpu_has_runstate(p))
                 continue;
-#define PCT(f) (100.0 * (double)(f(v) - f(p)) / (dt * 1e9))
-            printf("dom %u vcpu %u: running %5.1f%%  runnable (steal) %5.1f%%"
-                   "  blocked %5.1f%%  offline %5.1f%%\n",
-                   xenstat_domain_id(d), j, PCT(xenstat_vcpu_ns),
-                   PCT(xenstat_vcpu_runnable_ns), PCT(xenstat_vcpu_blocked_ns),
-                   PCT(xenstat_vcpu_offline_ns));
+            {
+                /*
+                 * Over the hypervisor's own snapshot times when it reports
+                 * them: the four states then add up to exactly 100%.
+                 * Otherwise over this process's clock, which they don't.
+                 */
+                unsigned long long t1 = xenstat_vcpu_runstate_time_ns(v);
+                unsigned long long t0 = xenstat_vcpu_runstate_time_ns(p);
+                double span = (t0 && t1 > t0) ? (double)(t1 - t0) : dt * 1e9;
+#define DELTA(f) ((double)(f(v) - f(p)))
+#define PCT(f) (100.0 * DELTA(f) / span)
+                printf("dom %u vcpu %u: running %5.1f%%  runnable (steal) %5.1f%%"
+                       "  blocked %5.1f%%  offline %5.1f%%  sum %6.2f%%  (%s)\n",
+                       xenstat_domain_id(d), j, PCT(xenstat_vcpu_running_ns),
+                       PCT(xenstat_vcpu_runnable_ns), PCT(xenstat_vcpu_blocked_ns),
+                       PCT(xenstat_vcpu_offline_ns),
+                       100.0 * (DELTA(xenstat_vcpu_running_ns) +
+                                DELTA(xenstat_vcpu_runnable_ns) +
+                                DELTA(xenstat_vcpu_blocked_ns) +
+                                DELTA(xenstat_vcpu_offline_ns)) / span,
+                       (t0 && t1 > t0) ? "hypervisor time" : "wall clock");
 #undef PCT
+#undef DELTA
+            }
         }
     }
 

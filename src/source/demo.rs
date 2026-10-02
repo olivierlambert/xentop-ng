@@ -626,6 +626,7 @@ impl DemoSource {
                     online: true,
                     ns: 0,
                     runnable_ns: Some(0),
+                    runstate_at_ns: None,
                 };
                 vcpus
             ],

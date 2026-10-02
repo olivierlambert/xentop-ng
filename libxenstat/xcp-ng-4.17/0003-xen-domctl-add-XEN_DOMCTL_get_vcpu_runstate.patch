@@ -1,4 +1,4 @@
-From df7e4e84e134d555f992e8fbd3268b9542ab9fa3 Mon Sep 17 00:00:00 2001
+From 47f62ca7f6ed7dab4e5363730e362f465f321ac1 Mon Sep 17 00:00:00 2001
 From: Olivier Lambert <olivier.lambert@vates.tech>
 Date: Thu, 1 Oct 2026 08:04:01 +0200
 Subject: [PATCH] xen/domctl: add XEN_DOMCTL_get_vcpu_runstate
@@ -12,12 +12,25 @@ physical CPU.  That "steal time" is the most direct measure of CPU
 contention on a host, and monitoring tools in dom0 (xentop and friends)
 cannot show it today.
 
-Add XEN_DOMCTL_get_vcpu_runstate, which returns vcpu_runstate_get() for
-one vCPU of the target domain: the current state, when it was entered,
-and the time spent in each RUNSTATE_*, up to the time of the call.  Like
-XEN_DOMCTL_getvcpuinfo it only reads scheduler accounting, so it is
-handled the same way, right next to it, and covered by the same XSM
-permission (domain getvcpuinfo).
+Add XEN_DOMCTL_get_vcpu_runstate, which returns the runstate of one vCPU
+of the target domain: the current state, when it was entered, the time
+spent in each RUNSTATE_*, and sample_time, the system time those times
+run to.  Like XEN_DOMCTL_getvcpuinfo it only reads scheduler accounting,
+so it is handled the same way, right next to it, and covered by the same
+XSM permission (domain getvcpuinfo).
+
+The times are only meaningful against sample_time.  vcpu_runstate_get()
+brings the current state's time up to its own NOW(); a caller pairing
+the result with a clock it reads before or after the hypercall mixes
+two time bases.  If it is descheduled in between, which is exactly
+when the host is contended, the rates it computes are skewed, and
+steal time can exceed 100%.  So read NOW() inside the same seqcount
+snapshot as the times, through a new vcpu_runstate_snapshot() that
+vcpu_runstate_get() now wraps, and return it with them.
+
+sample_time is the last field of the structure: a hypervisor carrying
+an earlier version of this patch leaves it at the 0 callers pass in,
+which they can treat as "not reported".
 
 This is the XCP-ng 4.17 backport.  XCP-ng's own whole-domain
 XEN_DOMCTL_get_runstate_info (98) is unrelated and left alone; this
@@ -31,26 +44,30 @@ Also add the libxenctrl wrapper xc_vcpu_get_runstate().
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 ---
- tools/include/xenctrl.h             | 11 +++++++++++
- tools/libs/ctrl/xc_domain.c         | 19 +++++++++++++++++++
- xen/common/domctl.c                 | 24 ++++++++++++++++++++++++
- xen/include/public/domctl.h         | 20 ++++++++++++++++++++
+ tools/include/xenctrl.h             | 13 +++++++++++
+ tools/libs/ctrl/xc_domain.c         | 19 ++++++++++++++++
+ xen/common/domctl.c                 | 24 ++++++++++++++++++++
+ xen/common/sched/core.c             | 34 ++++++++++++++++++++++++++---
+ xen/include/public/domctl.h         | 27 +++++++++++++++++++++++
+ xen/include/xen/sched.h             |  2 ++
  xen/xsm/flask/hooks.c               |  1 +
  xen/xsm/flask/policy/access_vectors |  1 +
- 6 files changed, 76 insertions(+)
+ 8 files changed, 118 insertions(+), 3 deletions(-)
 
 diff --git a/tools/include/xenctrl.h b/tools/include/xenctrl.h
-index bc6738d..25973f8 100644
+index bc6738deea..4c37a99b5b 100644
 --- a/tools/include/xenctrl.h
 +++ b/tools/include/xenctrl.h
-@@ -860,6 +860,17 @@ int xc_vcpu_getinfo(xc_interface *xch,
+@@ -860,6 +860,19 @@ int xc_vcpu_getinfo(xc_interface *xch,
                      uint32_t vcpu,
                      xc_vcpuinfo_t *info);
  
 +/*
-+ * Time vCPU @vcpu of @domid has spent in each RUNSTATE_* so far (running,
-+ * runnable i.e. waiting for a pCPU, blocked, offline).  Hypervisors without
-+ * XEN_DOMCTL_get_vcpu_runstate fail it, usually with errno ENOSYS.
++ * Time vCPU @vcpu of @domid has spent in each RUNSTATE_* (running, runnable
++ * i.e. waiting for a pCPU, blocked, offline), up to info->sample_time.
++ * Compute rates against differences in sample_time, not the caller's clock.
++ * Hypervisors without XEN_DOMCTL_get_vcpu_runstate fail it, usually with
++ * errno ENOSYS.
 + */
 +typedef struct xen_domctl_vcpu_runstate xc_vcpu_runstate_t;
 +int xc_vcpu_get_runstate(xc_interface *xch,
@@ -62,7 +79,7 @@ index bc6738d..25973f8 100644
                                    uint32_t domid,
                                    int vcpu);
 diff --git a/tools/libs/ctrl/xc_domain.c b/tools/libs/ctrl/xc_domain.c
-index 951ab2a..0bb0318 100644
+index 951ab2a530..0bb0318f31 100644
 --- a/tools/libs/ctrl/xc_domain.c
 +++ b/tools/libs/ctrl/xc_domain.c
 @@ -1339,6 +1339,25 @@ int xc_vcpu_getinfo(xc_interface *xch,
@@ -92,7 +109,7 @@ index 951ab2a..0bb0318 100644
  {
      /* The main caller is statically linked.  Careful with the ABI. */
 diff --git a/xen/common/domctl.c b/xen/common/domctl.c
-index 7471801..02acf52 100644
+index 74718010aa..05608bf195 100644
 --- a/xen/common/domctl.c
 +++ b/xen/common/domctl.c
 @@ -848,6 +848,30 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
@@ -109,7 +126,7 @@ index 7471801..02acf52 100644
 +        if ( (v = domain_vcpu(d, op->u.vcpu_runstate.vcpu)) == NULL )
 +            break;
 +
-+        vcpu_runstate_get(v, &runstate);
++        op->u.vcpu_runstate.sample_time = vcpu_runstate_snapshot(v, &runstate);
 +
 +        BUILD_BUG_ON(ARRAY_SIZE(op->u.vcpu_runstate.time) !=
 +                     ARRAY_SIZE(runstate.time));
@@ -126,11 +143,77 @@ index 7471801..02acf52 100644
      case XEN_DOMCTL_max_mem:
      {
          uint64_t new_max = op->u.max_mem.max_memkb >> (PAGE_SHIFT - 10);
+diff --git a/xen/common/sched/core.c b/xen/common/sched/core.c
+index a051ac22e2..c09ef35404 100644
+--- a/xen/common/sched/core.c
++++ b/xen/common/sched/core.c
+@@ -387,6 +387,8 @@ void sched_guest_idle(void (*idle) (void), unsigned int cpu)
+ 
+ /**
+  * vcpu_runstate_get(): Return vCPU time spent in different runstates
++ * (implemented by vcpu_runstate_read(), which also returns the time the
++ * snapshot runs to in @now)
+  *
+  * @param v:        vCPU to get runstate times (since vCPU start)
+  * @param runstate: Return time spent in each runstate.
+@@ -397,8 +399,8 @@ void sched_guest_idle(void (*idle) (void), unsigned int cpu)
+  *                  value(no need to change all callers) of this function.
+  * @returns         struct with non-affine running time since vcpu creation
+  */
+-struct vcpu_runstate_extra vcpu_runstate_get(
+-    const struct vcpu *v, struct vcpu_runstate_info *runstate)
++static struct vcpu_runstate_extra vcpu_runstate_read(
++    const struct vcpu *v, struct vcpu_runstate_info *runstate, s_time_t *now)
+ {
+     struct vcpu_runstate_extra ret;
+     struct seqcount seq = SEQCNT_ZERO();
+@@ -415,7 +417,8 @@ struct vcpu_runstate_extra vcpu_runstate_get(
+ 
+         *runstate = v->runstate;
+         ret = v->runstate_extra;
+-        delta = NOW() - runstate->state_entry_time;
++        *now = NOW();
++        delta = *now - runstate->state_entry_time;
+         if ( delta > 0 )
+         {
+             runstate->time[runstate->state] += delta;
+@@ -431,6 +434,31 @@ struct vcpu_runstate_extra vcpu_runstate_get(
+     return ret;
+ }
+ 
++struct vcpu_runstate_extra vcpu_runstate_get(
++    const struct vcpu *v, struct vcpu_runstate_info *runstate)
++{
++    s_time_t now;
++
++    return vcpu_runstate_read(v, runstate, &now);
++}
++
++/*
++ * Runstate times of @v, with the current state's time brought up to the
++ * system time returned.  That time is read inside the same consistent
++ * snapshot, so a caller computing rates can pair each snapshot with the
++ * exact instant it describes, rather than with a clock read before or
++ * after the call (and possibly far from it, if the caller was descheduled).
++ */
++s_time_t vcpu_runstate_snapshot(const struct vcpu *v,
++                                struct vcpu_runstate_info *runstate)
++{
++    s_time_t now;
++
++    (void)vcpu_runstate_read(v, runstate, &now);
++
++    return now;
++}
++
+ void domain_runstate_get(struct domain *d, domain_runstate_info_t *info)
+ {
+     struct vcpu *v;
 diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
-index e9022dd..2f635e1 100644
+index e9022dd329..b2b015bef4 100644
 --- a/xen/include/public/domctl.h
 +++ b/xen/include/public/domctl.h
-@@ -293,6 +293,24 @@ struct xen_domctl_getvcpuinfo {
+@@ -293,6 +293,31 @@ struct xen_domctl_getvcpuinfo {
      uint32_t cpu;                     /* current mapping   */
  };
  
@@ -139,8 +222,14 @@ index e9022dd..2f635e1 100644
 + *
 + * Runstate accounting of one vCPU of the target domain: the data
 + * VCPUOP_get_runstate_info returns to the vCPU's own domain, brought up to
-+ * the time of the call.  Lets a toolstack tell time a vCPU spent waiting for
-+ * a physical CPU (RUNSTATE_runnable, i.e. steal time) from time spent idle.
++ * sample_time.  Lets a toolstack tell time a vCPU spent waiting for a
++ * physical CPU (RUNSTATE_runnable, i.e. steal time) from time spent idle.
++ *
++ * All OUT fields come from one consistent snapshot.  To compute rates,
++ * divide differences in time[] between two calls by the difference in
++ * sample_time, not by a clock read in the caller: the caller can be
++ * descheduled between the hypercall and its own clock read, which is
++ * exactly when the host is contended.
 + */
 +struct xen_domctl_vcpu_runstate {
 +    /* IN variables. */
@@ -149,13 +238,14 @@ index e9022dd..2f635e1 100644
 +    uint32_t state;                    /* current RUNSTATE_* */
 +    uint64_aligned_t state_entry_time; /* when it was entered (system time, ns) */
 +    uint64_aligned_t time[4];          /* ns spent in each RUNSTATE_* */
++    uint64_aligned_t sample_time;      /* system time (ns) time[] runs to */
 +};
 +typedef struct xen_domctl_vcpu_runstate xen_domctl_vcpu_runstate_t;
 +
  
  /* Get/set the NUMA node(s) with which the guest has affinity with. */
  /* XEN_DOMCTL_setnodeaffinity */
-@@ -1323,6 +1341,7 @@ struct xen_domctl {
+@@ -1323,6 +1348,7 @@ struct xen_domctl {
  #define XEN_DOMCTL_vmtrace_op                    84
  #define XEN_DOMCTL_get_paging_mempool_size       85
  #define XEN_DOMCTL_set_paging_mempool_size       86
@@ -163,7 +253,7 @@ index e9022dd..2f635e1 100644
  #define XEN_DOMCTL_get_runstate_info             98
  #define XEN_DOMCTL_gdbsx_guestmemio            1000
  #define XEN_DOMCTL_gdbsx_pausevcpu             1001
-@@ -1387,6 +1406,7 @@ struct xen_domctl {
+@@ -1387,6 +1413,7 @@ struct xen_domctl {
          struct xen_domctl_vuart_op          vuart_op;
          struct xen_domctl_vmtrace_op        vmtrace_op;
          struct xen_domctl_paging_mempool    paging_mempool;
@@ -171,8 +261,21 @@ index e9022dd..2f635e1 100644
          uint8_t                             pad[128];
      } u;
  };
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index 1721e70c3d..8dd9231a14 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -1063,6 +1063,8 @@ int vcpu_affinity_domctl(struct domain *d, uint32_t cmd,
+ 
+ struct vcpu_runstate_extra vcpu_runstate_get(
+     const struct vcpu *v, struct vcpu_runstate_info *runstate);
++s_time_t vcpu_runstate_snapshot(const struct vcpu *v,
++                                struct vcpu_runstate_info *runstate);
+ void domain_runstate_get(struct domain *d, domain_runstate_info_t *info);
+ 
+ uint64_t get_cpu_idle_time(unsigned int cpu);
 diff --git a/xen/xsm/flask/hooks.c b/xen/xsm/flask/hooks.c
-index 33fedd4..9a9a6a9 100644
+index 33fedd46b8..9a9a6a9b0a 100644
 --- a/xen/xsm/flask/hooks.c
 +++ b/xen/xsm/flask/hooks.c
 @@ -749,6 +749,7 @@ static int cf_check flask_domctl(struct domain *d, struct xen_domctl *op)
@@ -184,7 +287,7 @@ index 33fedd4..9a9a6a9 100644
  
      case XEN_DOMCTL_settimeoffset:
 diff --git a/xen/xsm/flask/policy/access_vectors b/xen/xsm/flask/policy/access_vectors
-index 48bc550..e851126 100644
+index 48bc5502b9..e851126cfa 100644
 --- a/xen/xsm/flask/policy/access_vectors
 +++ b/xen/xsm/flask/policy/access_vectors
 @@ -143,6 +143,7 @@ class domain
