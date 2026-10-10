@@ -16,7 +16,7 @@
 //!   XCP-ng: "/dev/sm/backend/<sr>/<vdi>"; plain Xen: a device or file
 //!   path, possibly with a "<format>:" prefix
 //! - `.../sm-data/vdi-uuid` and `.../sm-data/mem-pool` (the SR), only when
-//!   `params` doesn't say
+//!   `params` doesn't say, whatever the backend kind
 //!
 //! The SR flavour (ext, nfs, lvm...) is not in xenstore. It is worked out
 //! once per SR from where `/dev/sm/phy/<sr>/<vdi>` points and, for file
@@ -216,9 +216,12 @@ impl StorageMap {
                         Some((p, b)) if *p == params => b.clone(),
                         _ => {
                             let mut b = parse_params(&params);
-                            if b.sr.is_none() && b.vdi.is_none() && v.kind == VbdKind::Vbd3 {
+                            if b.sr.is_none() && b.vdi.is_none() {
                                 // Not a path we understand: SM also publishes
                                 // the VDI and its SR ("mem-pool") under sm-data.
+                                // Not only for vbd3: an SM driver that attaches
+                                // a block device for blkback (params "/dev/loop0")
+                                // publishes the same keys under backend/vbd.
                                 let sm =
                                     |k: &str| xs.read(&format!("{node}/sm-data/{k}")).and_then(|s| uuid(&s));
                                 b.vdi = sm("vdi-uuid");
