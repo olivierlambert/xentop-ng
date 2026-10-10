@@ -254,11 +254,15 @@ impl XenstatSource {
     /// reports it: the only place its data structures are touched.
     fn read_node(&self) -> Result<Snapshot> {
         let a = &self.api;
+        // Stamp before the call: the domain counters are read near its start,
+        // and the call itself can take most of a second while dom0 builds or
+        // tears down a domain. A stamp taken after it would divide a counter
+        // delta by an interval that does not match it.
+        let at = Instant::now();
         let node = unsafe { (a.get_node)(self.handle, XENSTAT_ALL) };
         if node.is_null() {
             bail!("xenstat_get_node() failed");
         }
-        let at = Instant::now();
 
         // SAFETY: every pointer below is owned by `node` and stays valid
         // until xenstat_free_node(), which we call once we've copied out.

@@ -587,6 +587,11 @@ pub fn compute(prev: &Snapshot, cur: &Snapshot) -> Rates {
 
         if let Some(p) = p {
             r.cpu_pct = d(dom.cpu_ns, p.cpu_ns) as f64 / dt_ns * 100.0;
+            // Same ceiling as the per-vCPU values below: one sample's timing
+            // jitter must not show a domain above what its vCPUs can run.
+            if !dom.vcpus.is_empty() {
+                r.cpu_pct = r.cpu_pct.min(dom.vcpus.len() as f64 * 100.0);
+            }
             r.vcpu_pct = dom
                 .vcpus
                 .iter()
@@ -859,6 +864,20 @@ mod rate_tests {
             vm_uuid: None,
             mem_target: None,
         }
+    }
+
+    #[test]
+    fn domain_cpu_never_exceeds_its_vcpus() {
+        // A late timestamp can make a delta look longer than the interval:
+        // 1.5 s of CPU in 1 s on a single vCPU.
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        let r = compute(
+            &snap(t0, vec![dom(5, "vm", 0, 0)]),
+            &snap(t1, vec![dom(5, "vm", 1_500_000_000, 0)]),
+        );
+        assert_eq!(r.domains[0].cpu_pct, 100.0);
+        assert_eq!(r.domains[0].vcpu_pct, vec![100.0]);
     }
 
     #[test]
